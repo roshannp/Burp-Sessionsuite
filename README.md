@@ -1,4 +1,4 @@
-# Sessionsuite
+# Burp-Sessionsuite
 Burp Extension for Granular session checks
 
 ### Step 1: Set the Jython JAR File in Extensions (I have used the latest jython-standalone-2.7.4) 
