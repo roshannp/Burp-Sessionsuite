@@ -1,48 +1,61 @@
-# SessionSuite
+# SessionSuite (advanced + behavioral LOGOUT)
 # Jython 2.7.x, Burp Extender API
-# - JWT deep analysis: exp/iat/nbf windows, long lifetime, alg review
-# - Fixation/rotation checks: login should rotate; refresh should rotate
-# - Replay & expiry tests: replay last seen bearer/cookie; synthesize expired JWT
-# - Multiple session awareness: concurrent token sightings
-# - Export CSV/JSON for Tracker and Analyzer
+#
+# Features:
+# - Tracker: cookies, bearer tokens, JWTs (request/response, hashed ids)
+# - Security Analyzer: cookie flags (Secure/HttpOnly/SameSite), deep JWT checks
+# - Auth Flow: LOGIN / REFRESH / LOGOUT (endpoint + behavioral) + 401/403
+# - Consistency Checker: generate Repeater tests (no-cookie, no-auth, invalid bearer,
+#   corrupt JWT, replay last bearer, expired JWT)
+# - Rotation/fixation: flag same session across login; non-rotating JWT on refresh
+# - Multiple-session awareness: repeated token sightings
+# - Export: CSV/JSON for Tracker and Analyzer; DOT export for flow
 #
 from burp import IBurpExtender, ITab, IHttpListener, IContextMenuFactory
 from java.util import ArrayList
 from javax.swing import (JPanel, JTabbedPane, JTable, JScrollPane, JButton, JLabel,
                          JCheckBox, BoxLayout, Box, JMenuItem, JOptionPane, JFileChooser,
-                         JTextArea, JSplitPane, SwingUtilities)
+                         JTextArea, SwingUtilities)
 from javax.swing.table import DefaultTableModel
 from java.awt import BorderLayout, Dimension
 import time, re, json, hashlib, base64
 
 # ---------- utils ----------
 
-def now_ts(): return time.strftime("%Y-%m-%d %H:%M:%S")
+def now_ts():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
 
 def sha1_short(s):
-    try: h = hashlib.sha1(s).hexdigest()
-    except: h = hashlib.sha1(s.encode('utf-8')).hexdigest()
+    try:
+        h = hashlib.sha1(s).hexdigest()
+    except:
+        h = hashlib.sha1(s.encode('utf-8')).hexdigest()
     return h[:10]
 
 def b64url_decode(s):
     s = s.replace('-', '+').replace('_', '/')
     pad = len(s) % 4
-    if pad: s += '=' * (4 - pad)
+    if pad:
+        s += '=' * (4 - pad)
     return base64.b64decode(s)
 
 def b64url_encode(b):
     s = base64.b64encode(b)
-    s = s.replace('+','-').replace('/','_')
-    return s.replace('=','')
+    s = s.replace('+', '-').replace('/', '_')
+    return s.replace('=', '')
 
 JWT_RE = re.compile(r'eyJ[0-9A-Za-z_-]*\.[0-9A-Za-z_-]*\.[0-9A-Za-z_-]*')
 SESSION_COOKIE_HINTS = re.compile(r'(session|sess|sid|jsessionid|phpsessid|auth|token)', re.I)
-LOGIN_HINTS, REFRESH_HINTS, LOGOUT_HINTS = re.compile(r'login|signin|auth', re.I), re.compile(r'refresh|token', re.I), re.compile(r'logout|signout', re.I)
+LOGIN_HINTS   = re.compile(r'login|signin|auth', re.I)
+REFRESH_HINTS = re.compile(r'refresh|token', re.I)
+# Expanded to catch more server-side logout patterns
+LOGOUT_HINTS  = re.compile(r'logout|signout|revoke|invalidate|session(s)?/?(terminate|destroy)?', re.I)
 
 def try_decode_jwt(jwt_str):
     try:
         parts = jwt_str.split('.')
-        if len(parts) < 2: return None, None
+        if len(parts) < 2:
+            return None, None
         hdr = json.loads(b64url_decode(parts[0]))
         pl  = json.loads(b64url_decode(parts[1]))
         return hdr, pl
@@ -51,7 +64,8 @@ def try_decode_jwt(jwt_str):
 
 def parse_cookies_from_header(cookie_header_val):
     items = []
-    if not cookie_header_val: return items
+    if not cookie_header_val:
+        return items
     for p in cookie_header_val.split(';'):
         if '=' in p:
             name, val = p.strip().split('=', 1)
@@ -64,9 +78,12 @@ def parse_set_cookie_lines(resp_headers):
         if h.lower().startswith('set-cookie:'):
             line = h.split(':',1)[1].strip()
             parts = [x.strip() for x in line.split(';')]
-            if not parts: continue
-            if '=' in parts[0]: name, val = parts[0].split('=',1)
-            else: name, val = parts[0], ''
+            if not parts:
+                continue
+            if '=' in parts[0]:
+                name, val = parts[0].split('=',1)
+            else:
+                name, val = parts[0], ''
             attrs = {}
             for a in parts[1:]:
                 if '=' in a:
@@ -84,48 +101,61 @@ def cookie_issue_flags(attrs):
     return issues
 
 def is_in_scope(callbacks, url):
-    try: return callbacks.isInScope(url)
-    except: return True
+    try:
+        return callbacks.isInScope(url)
+    except:
+        return True
 
 # ---------- advanced checks ----------
 
-MAX_JWT_LIFETIME_SECONDS = 60*60*24*7  # 7 days threshold
-OLD_IAT_SECONDS = 60*60*24*30          # 30 days old iat
+MAX_JWT_LIFETIME_SECONDS = 60*60*24*7   # 7 days
+OLD_IAT_SECONDS          = 60*60*24*30  # 30 days
 
 def jwt_deep_issues(header, payload, now_epoch):
     issues = []
-    if header is None or payload is None: return ['JWT unparsable']
+    if header is None or payload is None:
+        return ['JWT unparsable']
     alg = header.get('alg')
-    if not alg: issues.append('JWT header missing alg')
-    elif str(alg).lower() == 'none': issues.append('JWT alg "none"')
+    if not alg:
+        issues.append('JWT header missing alg')
+    elif str(alg).lower() == 'none':
+        issues.append('JWT alg "none"')
     exp = payload.get('exp'); nbf = payload.get('nbf'); iat = payload.get('iat')
+
     # exp checks
     if exp is None:
         issues.append('JWT missing exp')
     else:
         try:
             expf = float(exp)
-            if now_epoch > expf: issues.append('JWT expired')
-            # long lifetime
+            if now_epoch > expf:
+                issues.append('JWT expired')
             if iat is not None:
                 try:
                     iatf = float(iat)
                     if expf - iatf > MAX_JWT_LIFETIME_SECONDS:
                         issues.append('JWT lifetime too long (>7d)')
-                except: pass
-        except: issues.append('JWT exp not numeric')
+                except:
+                    pass
+        except:
+            issues.append('JWT exp not numeric')
+
     # iat checks
     if iat is not None:
         try:
             if now_epoch - float(iat) > OLD_IAT_SECONDS:
                 issues.append('JWT iat very old (>30d)')
-        except: issues.append('JWT iat not numeric')
+        except:
+            issues.append('JWT iat not numeric')
+
     # nbf in future
     if nbf is not None:
         try:
-            if float(nbf) > now_epoch + 15:  # allow small clock skew
+            if float(nbf) > now_epoch + 15:  # allow small skew
                 issues.append('JWT nbf in the future')
-        except: issues.append('JWT nbf not numeric')
+        except:
+            issues.append('JWT nbf not numeric')
+
     return issues
 
 def synthesize_expired_jwt(jwt_str):
@@ -136,11 +166,10 @@ def synthesize_expired_jwt(jwt_str):
         pl  = json.loads(b64url_decode(parts[1]))
         pl['exp'] = int(time.time()) - 3600
         new_pl = b64url_encode(json.dumps(pl).encode('utf-8'))
-        # keep header, replace payload, leave signature as-is (invalid on purpose)
         parts[1] = new_pl
         return '.'.join(parts)
     except:
-        return jwt_str + 'A'  # fallback corruption
+        return jwt_str + 'A'
 
 # ---------- core extension ----------
 
@@ -159,11 +188,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.issues = []           # analyzer rows
         self.timeline = []         # flow events
 
-        # State for fixation/rotation/replay
-        self.last_cookie_id_by_host = {}     # host -> last seen session cookie hash (pre-login)
-        self.last_jwt_id_by_host    = {}     # host -> last seen jwt hash
-        self.last_bearer_raw_by_host= {}     # host -> last raw bearer for replay
-        self.concurrent_counter      = {}     # (host, token_hash) -> count
+        # State for fixation/rotation/replay/behavioral logout
+        self.last_cookie_id_by_host   = {}  # host -> last seen session cookie hash (pre-login)
+        self.last_jwt_id_by_host      = {}  # host -> last seen jwt hash
+        self.last_bearer_raw_by_host  = {}  # host -> last raw bearer for replay
+        self.concurrent_counter        = {}  # (host, ttype, name, tid) -> count
+        self.had_auth_recent           = {}  # host -> epoch of last request with Authorization
+        self.authless_streak           = {}  # host -> consecutive requests without Authorization
 
         # UI
         self._build_ui()
@@ -179,8 +210,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.trackerModel = DefaultTableModel(['time','host','type','name','id','where','url'], 0)
         self.trackerTable = JTable(self.trackerModel)
         bar1 = JPanel()
-        btnExpCSV1 = JButton("Export CSV", actionPerformed=lambda e: self._export_table_csv(self.trackerModel))
-        btnExpJSON1= JButton("Export JSON", actionPerformed=lambda e: self._export_table_json(self.trackerModel))
+        btnExpCSV1  = JButton("Export CSV",  actionPerformed=lambda e: self._export_table_csv(self.trackerModel))
+        btnExpJSON1 = JButton("Export JSON", actionPerformed=lambda e: self._export_table_json(self.trackerModel))
         bar1.add(btnExpCSV1); bar1.add(btnExpJSON1)
         p1 = JPanel(BorderLayout()); p1.add(JScrollPane(self.trackerTable), BorderLayout.CENTER); p1.add(bar1, BorderLayout.SOUTH)
 
@@ -191,8 +222,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.ccStripAuth    = JCheckBox("Test: strip Authorization", True)
         self.ccInvalidBearer= JCheckBox("Test: invalid Bearer", True)
         self.ccCorruptJWT   = JCheckBox("Test: corrupt JWT", True)
-        self.ccReplayLast   = JCheckBox("Test: replay last seen token (cookie/bearer)", True)
-        self.ccExpiredJWT   = JCheckBox("Test: JWT with expired exp", True)
+        self.ccReplayLast   = JCheckBox("Test: replay last seen bearer", True)
+        self.ccExpiredJWT   = JCheckBox("Test: expired JWT (exp in the past)", True)
         for w in [self.ccStripCookies, self.ccStripAuth, self.ccInvalidBearer, self.ccCorruptJWT, self.ccReplayLast, self.ccExpiredJWT]:
             p2.add(w)
 
@@ -205,8 +236,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         self.issuesModel = DefaultTableModel(['time','host','type','description','evidence','url'], 0)
         self.issuesTable = JTable(self.issuesModel)
         bar4 = JPanel()
-        btnExpCSV4 = JButton("Export CSV", actionPerformed=lambda e: self._export_table_csv(self.issuesModel))
-        btnExpJSON4= JButton("Export JSON", actionPerformed=lambda e: self._export_table_json(self.issuesModel))
+        btnExpCSV4  = JButton("Export CSV",  actionPerformed=lambda e: self._export_table_csv(self.issuesModel))
+        btnExpJSON4 = JButton("Export JSON", actionPerformed=lambda e: self._export_table_json(self.issuesModel))
         bar4.add(btnExpCSV4); bar4.add(btnExpJSON4)
         p4 = JPanel(BorderLayout()); p4.add(JScrollPane(self.issuesTable), BorderLayout.CENTER); p4.add(bar4, BorderLayout.SOUTH)
 
@@ -217,47 +248,66 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
         self.root = JPanel(BorderLayout()); self.root.add(self.tabs, BorderLayout.CENTER)
 
-    def getTabCaption(self): return "SessionSuite"
-    def getUiComponent(self): return self.root
+    def getTabCaption(self):
+        return "SessionSuite"
+
+    def getUiComponent(self):
+        return self.root
 
     # ---------- HTTP listener ----------
 
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         try:
-            if messageIsRequest: self._handle_request(messageInfo)
-            else: self._handle_response(messageInfo)
+            if messageIsRequest:
+                self._handle_request(messageInfo)
+            else:
+                self._handle_response(messageInfo)
         except Exception as e:
-            # keep Burp stable
             self.cb.printError("[SessionSuite] error: %s" % e)
 
     def _service_host(self, svc):
-        try: return svc.getHost()
-        except: return 'unknown'
+        try:
+            return svc.getHost()
+        except:
+            return 'unknown'
 
     def _handle_request(self, mi):
         req = mi.getRequest()
-        if not req: return
+        if not req:
+            return
         svc = mi.getHttpService()
         ana = self.helpers.analyzeRequest(svc, req)
         url = ana.getUrl()
-        if not is_in_scope(self.cb, url): return
+        if not is_in_scope(self.cb, url):
+            return
         host = self._service_host(svc)
         headers = ana.getHeaders()
         body = req[ana.getBodyOffset():]
-        try: body_txt = self.helpers.bytesToString(body)
-        except: body_txt = ""
+        try:
+            body_txt = self.helpers.bytesToString(body)
+        except:
+            body_txt = ""
 
-        # Authorization
+        # Authorization + behavioral logout tracking
+        saw_auth = False
         for h in headers:
             if h.lower().startswith('authorization:'):
                 val = h.split(':',1)[1].strip()
                 if val.lower().startswith('bearer '):
+                    saw_auth = True
                     token = val[7:].strip()
                     self._track_token('bearer', 'Authorization', token, 'request-header', host, url.toString())
                     self.last_bearer_raw_by_host[host] = token
                     if JWT_RE.search(token):
                         hdr, pl = try_decode_jwt(token)
                         self._record_jwt_deep_issues(host, url.toString(), token, hdr, pl)
+
+        now_e = time.time()
+        if saw_auth:
+            self.had_auth_recent[host] = now_e
+            self.authless_streak[host] = 0
+        else:
+            self.authless_streak[host] = self.authless_streak.get(host, 0) + 1
 
         # Cookie header
         for h in headers:
@@ -266,7 +316,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 for (name, val) in parse_cookies_from_header(cookie_line):
                     if SESSION_COOKIE_HINTS.search(name):
                         tid = self._track_token('cookie', name, val, 'request-header', host, url.toString())
-                        # record last seen for possible fixation checks
                         self.last_cookie_id_by_host[host] = tid
 
         # JWTs in body
@@ -277,26 +326,29 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
 
     def _handle_response(self, mi):
         resp = mi.getResponse()
-        if not resp: return
+        if not resp:
+            return
         svc = mi.getHttpService()
         ana_req = self.helpers.analyzeRequest(mi)
         url = ana_req.getUrl()
-        if not is_in_scope(self.cb, url): return
+        if not is_in_scope(self.cb, url):
+            return
         host = self._service_host(svc)
 
         ana = self.helpers.analyzeResponse(resp)
         headers = ana.getHeaders()
         body = resp[ana.getBodyOffset():]
-        try: body_txt = self.helpers.bytesToString(body)
-        except: body_txt = ""
+        try:
+            body_txt = self.helpers.bytesToString(body)
+        except:
+            body_txt = ""
 
-        # Set-Cookie
+        # Set-Cookie analysis
         sc_list = parse_set_cookie_lines(headers)
         for sc in sc_list:
             name, val, attrs = sc['name'], sc['value'], sc['attrs']
             if SESSION_COOKIE_HINTS.search(name):
                 tid = self._track_token('cookie', name, val, 'response-set-cookie', host, url.toString())
-                # analyzer
                 for iss in cookie_issue_flags(attrs):
                     self._report_issue(host, 'cookie', iss, 'Set-Cookie: %s' % name, url.toString())
 
@@ -305,50 +357,61 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             self._track_token('jwt', 'body-jwt', m, 'response-body', host, url.toString())
             hdr, pl = try_decode_jwt(m)
             self._record_jwt_deep_issues(host, url.toString(), m, hdr, pl)
+            # Refresh detection + rotation check
             if REFRESH_HINTS.search(url.getPath() or ''):
                 self._timeline_event(host, 'REFRESH', 'emitted JWT', url.toString(), self._status_from_headers(headers))
-                # rotation check
                 self._check_jwt_rotation(host, m, url.toString())
 
-        # flow/heuristics
+        # Flow events
         code = self._status_from_headers(headers)
         path = url.getPath() or ''
         if code in (401, 403):
             self._timeline_event(host, str(code), 'auth failure', url.toString(), code)
         if LOGOUT_HINTS.search(path):
-            self._timeline_event(host, 'LOGOUT', 'logout', url.toString(), code)
+            self._timeline_event(host, 'LOGOUT', 'logout endpoint hit', url.toString(), code)
         if LOGIN_HINTS.search(path) and code in (200, 302):
             self._timeline_event(host, 'LOGIN', 'login response', url.toString(), code)
             self._check_fixation_after_login(host, url.toString())
 
+        # Behavioral LOGOUT: previously authenticated, now N consecutive requests w/o auth
+        N = 3
+        recent = self.had_auth_recent.get(host)
+        if recent and self.authless_streak.get(host, 0) >= N and code in (200, 302, 401, 403):
+            self._timeline_event(host, 'LOGOUT', 'auth header disappeared (behavioral)', url.toString(), code)
+            # reset so we don’t spam multiple logouts
+            self.had_auth_recent.pop(host, None)
+            self.authless_streak[host] = 0
+
     def _status_from_headers(self, headers):
         try:
-            line = headers[0]; parts = line.split()
+            line = headers[0]
+            parts = line.split()
             return int(parts[1])
-        except: return 0
+        except:
+            return 0
 
     # ---------- trackers / analyzer / flow ----------
 
     def _track_token(self, ttype, name, value, where, host, url):
         tid = sha1_short(value or '')
-        key = '%s|%s|%s|%s' % (host, ttype, name, tid)
+        key = (host, ttype, name, tid)
         if key in self.token_seen:
-            # concurrent count
             self.concurrent_counter[key] = self.concurrent_counter.get(key, 1) + 1
-            if self.concurrent_counter[key] > 3:  # arbitrary threshold
+            if self.concurrent_counter[key] > 3:
                 self._report_issue(host, ttype, 'Token reused many times (possible concurrent sessions)', '%s [%s]' % (name, tid), url)
             return tid
         self.token_seen.add(key)
         row = [now_ts(), host, ttype, name, tid, where, url]
-        self.tokens.append(row); self._ui_add_row(self.trackerModel, row)
-        # remember last jwt id by host for rotation checks
+        self.tokens.append(row)
+        self._ui_add_row(self.trackerModel, row)
         if ttype in ('jwt','bearer'):
             self.last_jwt_id_by_host[host] = tid
         return tid
 
     def _report_issue(self, host, itype, desc, evidence, url):
         row = [now_ts(), host, itype, desc, evidence, url]
-        self.issues.append(row); self._ui_add_row(self.issuesModel, row)
+        self.issues.append(row)
+        self._ui_add_row(self.issuesModel, row)
 
     def _timeline_event(self, host, etype, detail, url, status):
         line = "[%s] %s | %s | %s | %s" % (now_ts(), host, etype, str(status), url)
@@ -360,18 +423,14 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         for iss in jwt_deep_issues(hdr, pl, now_e):
             ev = None
             try:
-                if hdr is not None: ev = 'alg=%s' % (hdr.get('alg'))
-            except: pass
+                if hdr is not None:
+                    ev = 'alg=%s' % (hdr.get('alg'))
+            except:
+                pass
             self._report_issue(host, 'jwt', iss, ev or 'jwt', url)
 
     def _check_fixation_after_login(self, host, url):
-        """
-        If we saw a session cookie before login and its hash is the same after login,
-        flag possible fixation.
-        """
-        # take latest two cookie sightings for host from tracker
         pre = self.last_cookie_id_by_host.get(host)
-        # scan latest Set-Cookie row (if any) to refresh current
         curr = None
         for i in range(len(self.tokens)-1, -1, -1):
             r = self.tokens[i]
@@ -381,9 +440,6 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             self._report_issue(host, 'session', 'Possible session fixation (ID unchanged across login)', 'cookie id=%s' % pre, url)
 
     def _check_jwt_rotation(self, host, new_jwt_raw, url):
-        """
-        On refresh, JWT should rotate. If hash same as last, flag.
-        """
         new_id = sha1_short(new_jwt_raw)
         last = self.last_jwt_id_by_host.get(host)
         if last and last == new_id:
@@ -427,7 +483,8 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                 for c in range(model.getColumnCount()):
                     obj[cols[c]] = str(model.getValueAt(r, c))
                 data.append(obj)
-            with open(path, 'w') as f: f.write(json.dumps(data, indent=2))
+            with open(path, 'w') as f:
+                f.write(json.dumps(data, indent=2))
             JOptionPane.showMessageDialog(self.root, "JSON exported.")
         except Exception as e:
             JOptionPane.showMessageDialog(self.root, "Export failed: %s" % e)
@@ -452,11 +509,13 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                     nid = '%s_%d' % (sha1_short(host), idx)
                     label = "%s\\n%s" % (ev['type'], ev['status'])
                     lines.append('%s [shape=box,label="%s"];' % (nid, label))
-                    if prev is not None: lines.append('%s -> %s;' % (prev, nid))
+                    if prev is not None:
+                        lines.append('%s -> %s;' % (prev, nid))
                     prev = nid
                 lines.append('}')
             lines.append("}")
-            with open(f.getAbsolutePath(), 'w') as fw: fw.write("\n".join(lines))
+            with open(f.getAbsolutePath(), 'w') as fw:
+                fw.write("\n".join(lines))
             JOptionPane.showMessageDialog(self.root, "DOT exported.")
         except Exception as e:
             JOptionPane.showMessageDialog(self.root, "Export failed: %s" % e)
@@ -477,15 +536,20 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         try:
             msgs = invocation.getSelectedMessages()
             if not msgs or len(msgs) == 0:
-                JOptionPane.showMessageDialog(self.root, "No messages selected."); return
-            for msg in msgs: self._gen_tests_for_message(msg)
+                JOptionPane.showMessageDialog(self.root, "No messages selected.")
+                return
+            for msg in msgs:
+                self._gen_tests_for_message(msg)
             JOptionPane.showMessageDialog(self.root, "Sent mutated requests to Repeater.")
         except Exception as e:
             JOptionPane.showMessageDialog(self.root, "Error: %s" % e)
 
     def _gen_tests_for_message(self, messageInfo):
         svc = messageInfo.getHttpService()
-        host, port, https = svc.getHost(), svc.getPort(), svc.getProtocol().lower().startswith('https')
+        host = svc.getHost()
+        port = svc.getPort()
+        https = svc.getProtocol().lower().startswith('https')
+
         req = messageInfo.getRequest()
         ana = self.helpers.analyzeRequest(svc, req)
         headers = list(ana.getHeaders())
@@ -512,9 +576,12 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
             hdrs = []; found = False
             for h in headers:
                 if h.lower().startswith('authorization:'):
-                    found = True; hdrs.append('Authorization: Bearer INVALID.TOKEN.VALUE')
-                else: hdrs.append(h)
-            if not found: hdrs.append('Authorization: Bearer INVALID.TOKEN.VALUE')
+                    found = True
+                    hdrs.append('Authorization: Bearer INVALID.TOKEN.VALUE')
+                else:
+                    hdrs.append(h)
+            if not found:
+                hdrs.append('Authorization: Bearer INVALID.TOKEN.VALUE')
             build_and_send(hdrs, body_str, "invalid-bearer")
 
         # corrupt first JWT (header or body)
@@ -532,31 +599,27 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
                         hdrs[i] = 'Authorization: Bearer ' + bad
                         build_and_send(hdrs, body_str, "corrupt-jwt-header"); mutated = True; break
             if not mutated:
-                # body
                 m = JWT_RE.search(body_str or '')
                 if m:
                     bad = self._corrupt_jwt(m.group(0))
                     b2 = body_str.replace(m.group(0), bad, 1)
                     build_and_send(headers, b2, "corrupt-jwt-body")
 
-        # replay last seen token (cookie or bearer)
+        # replay last seen bearer
         if self.ccReplayLast.isSelected():
             hdrs = list(headers)
-            # bearer
             last_bearer = self.last_bearer_raw_by_host.get(host)
-            replaced = False
             if last_bearer:
-                has_auth = False
+                # replace or add Authorization
+                replaced = False
                 for i in range(len(hdrs)):
                     if hdrs[i].lower().startswith('authorization:'):
-                        hdrs[i] = 'Authorization: Bearer %s' % last_bearer; has_auth = True; replaced = True
-                        break
-                if not has_auth:
-                    hdrs.append('Authorization: Bearer %s' % last_bearer); replaced = True
-            # cookie replay (use last session cookie id we saw — best-effort)
-            # NOTE: we store hashes, not raw cookie; this is a privacy choice.
-            # So we only exercise bearer replay meaningfully.
-            build_and_send(hdrs, body_str, "replay-last-bearer" if replaced else "replay-no-bearer-available")
+                        hdrs[i] = 'Authorization: Bearer %s' % last_bearer; replaced = True; break
+                if not replaced:
+                    hdrs.append('Authorization: Bearer %s' % last_bearer)
+                build_and_send(hdrs, body_str, "replay-last-bearer")
+            else:
+                build_and_send(headers, body_str, "replay-no-bearer-available")
 
         # expired JWT (set exp in the past)
         if self.ccExpiredJWT.isSelected():
@@ -579,8 +642,10 @@ class BurpExtender(IBurpExtender, IHttpListener, ITab, IContextMenuFactory):
         try:
             parts = jwt_str.split('.')
             if len(parts) >= 2 and len(parts[1]) > 2:
-                mid = parts[1]; flip = 'A' if mid[0] != 'A' else 'B'
-                parts[1] = flip + mid[1:]; return '.'.join(parts)
+                mid = parts[1]
+                flip = 'A' if mid[0] != 'A' else 'B'
+                parts[1] = flip + mid[1:]
+                return '.'.join(parts)
             return jwt_str + 'A'
         except:
             return jwt_str + 'A'
