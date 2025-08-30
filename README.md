@@ -94,11 +94,3 @@ Example Screenshots below:
 - Java 8+  
 
 ---
-
-## Notes
-
-- Token values are hashed in UI (privacy-safe).  
-- Scope filtering is respected. For demos, edit `is_in_scope()` to always `return True`.  
-- Replay tests for cookies are limited (only bearer replay uses real values).  
-
----
